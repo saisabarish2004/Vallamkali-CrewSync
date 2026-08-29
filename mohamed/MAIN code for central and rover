@@ -1,0 +1,286 @@
+working central code
+
+#include <WiFi.h>
+#include <esp_now.h>
+
+// -----------------------------
+// Motion Packet
+// -----------------------------
+typedef struct {
+  uint8_t rower_id;
+  uint32_t sequence;
+  uint32_t timestamp;
+
+  float ax;
+  float ay;
+  float az;
+
+  float gx;
+  float gy;
+  float gz;
+} MotionPacket;
+
+MotionPacket receivedPacket;
+
+
+uint32_t lastSequence[10] = {0};
+bool firstPacket[10] = {true};
+// -----------------------------
+// ESP-NOW Receive Callback
+// -----------------------------
+void onDataReceive(const esp_now_recv_info_t *info,
+                   const uint8_t *data,
+                   int len) {
+
+  // Check packet size
+  if (len != sizeof(MotionPacket)) {
+    Serial.print("Invalid packet size: ");
+    Serial.println(len);
+    return;
+  }
+
+  memcpy(&receivedPacket, data, sizeof(receivedPacket));
+
+  uint8_t id = receivedPacket.rower_id;
+
+if (id >= 10) {
+    Serial.println("Invalid Rower ID");
+    return;
+}
+
+if (firstPacket[id]) {
+
+    lastSequence[id] = receivedPacket.sequence;
+    firstPacket[id] = false;
+
+    Serial.println("First packet from this rower");
+
+} else {
+
+    uint32_t expected = lastSequence[id] + 1;
+
+    if (receivedPacket.sequence == expected) {
+
+        Serial.println("Sequence: OK");
+
+    } 
+    else if (receivedPacket.sequence > expected) {
+
+        Serial.print("PACKET LOSS! Expected: ");
+        Serial.print(expected);
+        Serial.print(" Received: ");
+        Serial.println(receivedPacket.sequence);
+
+    } 
+    else {
+
+        Serial.print("OLD/DUPLICATE PACKET. Received: ");
+        Serial.println(receivedPacket.sequence);
+    }
+
+    lastSequence[id] = receivedPacket.sequence;
+}
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("MotionPacket Received");
+  Serial.println("================================");
+
+  Serial.print("Rower ID: ");
+  Serial.println(receivedPacket.rower_id);
+
+  Serial.print("Sequence: ");
+  Serial.println(receivedPacket.sequence);
+
+  Serial.print("Timestamp: ");
+  Serial.println(receivedPacket.timestamp);
+
+  Serial.println();
+  Serial.println("Accel:");
+
+  Serial.print("AX: ");
+  Serial.println(receivedPacket.ax, 2);
+
+  Serial.print("AY: ");
+  Serial.println(receivedPacket.ay, 2);
+
+  Serial.print("AZ: ");
+  Serial.println(receivedPacket.az, 2);
+
+  Serial.println();
+  Serial.println("Gyro:");
+
+  Serial.print("GX: ");
+  Serial.println(receivedPacket.gx, 2);
+
+  Serial.print("GY: ");
+  Serial.println(receivedPacket.gy, 2);
+
+  Serial.print("GZ: ");
+  Serial.println(receivedPacket.gz, 2);
+
+  Serial.println("================================");
+}
+
+void setup() {
+
+  Serial.begin(115200);
+  delay(1000);
+
+  // WiFi Station mode
+  WiFi.mode(WIFI_STA);
+
+  Serial.println();
+  Serial.println("CENTRAL ESP32");
+  Serial.print("MAC Address: ");
+  Serial.println(WiFi.macAddress());
+
+  // Initialize ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW initialization FAILED");
+    return;
+  }
+
+  Serial.println("ESP-NOW initialized successfully");
+
+  // Register receive callback
+  esp_now_register_recv_cb(onDataReceive);
+
+  Serial.println("Waiting for MotionPacket...");
+}
+
+void loop() {
+}
+
+
+
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+
+
+ROVER woring code ::
+
+
+#include <WiFi.h>
+#include <esp_now.h>
+
+// ======================================
+// CENTRAL ESP32 MAC ADDRESS
+// ======================================
+
+uint8_t centralMAC[] = {
+  0x94, 0x54, 0xC5, 0x2F, 0x27, 0x28
+};
+
+
+// ======================================
+// Motion Packet
+// ======================================
+
+typedef struct {
+
+  uint8_t rower_id;
+  uint32_t sequence;
+  uint32_t timestamp;
+
+  float ax;
+  float ay;
+  float az;
+
+  float gx;
+  float gy;
+  float gz;
+
+} MotionPacket;
+
+MotionPacket packet;
+
+uint32_t sequenceNumber = 0;
+
+
+// ======================================
+// ESP-NOW SEND CALLBACK
+// ======================================
+
+void onDataSent(const wifi_tx_info_t *info,
+                esp_now_send_status_t status) {
+
+  // IMPORTANT:
+  // Do not print anything here for this test.
+}
+
+
+// ======================================
+// SETUP
+// ======================================
+
+void setup() {
+
+  // Serial is NOT required for communication.
+  // We leave it here only for optional debugging.
+  Serial.begin(115200);
+
+  delay(1000);
+
+  WiFi.mode(WIFI_STA);
+
+  // ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    return;
+  }
+
+  esp_now_register_send_cb(onDataSent);
+
+
+  // Add Central as peer
+
+  esp_now_peer_info_t peerInfo = {};
+
+  memcpy(peerInfo.peer_addr, centralMAC, 6);
+
+  peerInfo.channel = 0;
+
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    return;
+  }
+}
+
+
+// ======================================
+// LOOP
+// ======================================
+
+void loop() {
+
+  packet.rower_id = 2;
+
+  packet.sequence = sequenceNumber++;
+
+  packet.timestamp = millis();
+
+  // Dummy IMU data
+
+  packet.ax = 1.2;
+  packet.ay = 0.4;
+  packet.az = 9.8;
+
+  packet.gx = 0.1;
+  packet.gy = 0.2;
+  packet.gz = 0.3;
+
+
+  // Send packet
+
+  esp_now_send(
+    centralMAC,
+    (uint8_t *)&packet,
+    sizeof(packet)
+  );
+
+
+  // Exactly 500 ms
+
+  delay(500);
+}
