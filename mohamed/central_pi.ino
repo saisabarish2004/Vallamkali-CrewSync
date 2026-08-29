@@ -89,25 +89,35 @@ typedef struct {
 // ---------------------------------------------------------------- batch
 
 #define STROKES 3
-// 3 strokes x slowest stroke period x 2. Raise it if you see "batch timeout"
-// in the monitor while people are still rowing.
-#define BATCH_TIMEOUT_MS 6000
+
+// A rolling buffer, not a fixed batch. Each rower always keeps its latest 3
+// strokes. If one band drops a packet, the other rowers keep their good data
+// and we simply wait for that band to catch up, instead of discarding all 9.
+#define MIN_SEND_INTERVAL 1500     // do not flood the Pi
+#define STALE_MS          8000     // a rower this quiet has stopped rowing
+
+// Set to 1 if you want a line per stroke. Off by default so the monitor only
+// shows a complete batch and the decision.
+#define VERBOSE 0
 
 struct Slot {
-  uint32_t t0;                    // stroke START, ms, stamped here
+  uint32_t t0;                     // stroke START, ms, reconstructed here
   float    angle;
   float    acc;
 };
 
-Slot  slot[3][STROKES];           // [rower 0..2][stroke 0..2]
-int   count[3] = {0, 0, 0};
-uint32_t batchStart = 0;
-bool  batchOpen = false;
+Slot     ring[3][STROKES];         // [rower 0..2][slot]
+int      writeIdx[3] = {0, 0, 0};  // next slot to overwrite
+int      have[3]     = {0, 0, 0};  // strokes held, caps at STROKES
+uint32_t lastStroke[3] = {0, 0, 0};
+uint32_t lastSend = 0;
+bool     newSinceSend = false;
+bool     warnedIncomplete = false;
 
-// ESP-NOW callbacks must stay short. Strokes land in this queue and the
-// main loop does the printing and the UART work.
-StrokePacket  pendingPkt[8];
-volatile int  qHead = 0, qTail = 0;
+// ESP-NOW callbacks must stay short. Strokes queue here and the main loop
+// does the printing and the UART work.
+StrokePacket pendingPkt[8];
+volatile int qHead = 0, qTail = 0;
 
 char piLine[16];
 size_t piLen = 0;
@@ -165,33 +175,43 @@ void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) { }
 
 // ---------------------------------------------------------------- batching
 
-void resetBatch() {
-  count[0] = count[1] = count[2] = 0;
-  batchOpen = false;
+bool batchReady() {
+  uint32_t now = millis();
+  for (int r = 0; r < 3; r++) {
+    if (have[r] < STROKES) return false;             // not enough yet
+    if (now - lastStroke[r] > STALE_MS) return false; // this rower stopped
+  }
+  return true;
 }
 
 void sendBatchToPi() {
-  char msg[160];
-  int n = snprintf(msg, sizeof(msg), "D");
-
-  // earliest stroke start across all nine becomes time zero
-  uint32_t origin = slot[0][0].t0;
+  // oldest of the 3 held strokes comes first
+  Slot ordered[3][STROKES];
   for (int r = 0; r < 3; r++)
     for (int i = 0; i < STROKES; i++)
-      if ((int32_t)(slot[r][i].t0 - origin) < 0) origin = slot[r][i].t0;
+      ordered[r][i] = ring[r][(writeIdx[r] + i) % STROKES];
+
+  // earliest stroke start across all nine becomes time zero
+  uint32_t origin = ordered[0][0].t0;
+  for (int r = 0; r < 3; r++)
+    for (int i = 0; i < STROKES; i++)
+      if ((int32_t)(ordered[r][i].t0 - origin) < 0) origin = ordered[r][i].t0;
+
+  char msg[160];
+  int n = snprintf(msg, sizeof(msg), "D");
 
   for (int r = 0; r < 3; r++) {
     // angle and power averaged: they describe technique and barely change
     // stroke to stroke, so three values each would be wasted bytes
     float aSum = 0, pSum = 0;
     for (int i = 0; i < STROKES; i++) {
-      aSum += slot[r][i].angle;
-      pSum += slot[r][i].acc;
+      aSum += ordered[r][i].angle;
+      pSum += ordered[r][i].acc;
     }
     n += snprintf(msg + n, sizeof(msg) - n, "|%lu,%lu,%lu,%d,%d",
-                  (unsigned long)(slot[r][0].t0 - origin),
-                  (unsigned long)(slot[r][1].t0 - origin),
-                  (unsigned long)(slot[r][2].t0 - origin),
+                  (unsigned long)(ordered[r][0].t0 - origin),
+                  (unsigned long)(ordered[r][1].t0 - origin),
+                  (unsigned long)(ordered[r][2].t0 - origin),
                   (int)(aSum / STROKES + 0.5),
                   (int)(pSum / STROKES * 10 + 0.5));
   }
@@ -200,38 +220,34 @@ void sendBatchToPi() {
   Serial.print("[to Pi] ");
   Serial.println(msg);
 
-  resetBatch();
+  lastSend = millis();
+  newSinceSend = false;
+  warnedIncomplete = false;
 }
 
 void storeStroke(StrokePacket &p) {
   uint32_t now = millis();
-
-  if (!batchOpen) {
-    batchStart = now;
-    batchOpen = true;
-  }
-
   int r = p.rower - 1;
-  if (count[r] >= STROKES) return;      // this rower is ahead, ignore extras
 
   // The band sends AFTER the stroke finishes, so the stroke began
-  // duration_ms ago. Store it absolute; offsets are worked out at send time
-  // against the earliest of all nine. Do NOT clamp to batchStart here -
-  // batchStart is an arrival time, and every stroke starts before it.
+  // duration_ms ago. Stored absolute; offsets are worked out at send time.
   uint32_t t0 = now - p.duration_ms;
 
-  slot[r][count[r]].t0    = t0;
-  slot[r][count[r]].angle = p.angle;
-  slot[r][count[r]].acc   = p.peak_acc;
-  count[r]++;
+  ring[r][writeIdx[r]].t0    = t0;
+  ring[r][writeIdx[r]].angle = p.angle;
+  ring[r][writeIdx[r]].acc   = p.peak_acc;
 
-  Serial.printf("R%u stroke %lu  dur=%lu acc=%.2f ang=%.1f   [%d %d %d]\n",
+  writeIdx[r] = (writeIdx[r] + 1) % STROKES;
+  if (have[r] < STROKES) have[r]++;
+  lastStroke[r] = now;
+  newSinceSend = true;
+
+#if VERBOSE
+  Serial.printf("R%u stroke %lu  dur=%lu acc=%.2f ang=%.1f   held [%d %d %d]\n",
                 p.rower, (unsigned long)p.stroke_id,
                 (unsigned long)p.duration_ms, p.peak_acc, p.angle,
-                count[0], count[1], count[2]);
-
-  if (count[0] >= STROKES && count[1] >= STROKES && count[2] >= STROKES)
-    sendBatchToPi();
+                have[0], have[1], have[2]);
+#endif
 }
 
 // ---------------------------------------------------------------- pi rx
@@ -254,16 +270,45 @@ const char *faultName(int fault) {
   return "NONE";
 }
 
+const char *faultShort(int fault) {
+  if (fault == 1) return "TIMING";
+  if (fault == 2) return "ANGLE";
+  if (fault == 3) return "POWER";
+  return "-";
+}
+
+// one clear status block per decision
+void showStatus(int rower, int fault) {
+  Serial.println();
+  Serial.println("+--------+---------+--------------+");
+  Serial.println("| ROWER  | STATUS  | FEEDBACK     |");
+  Serial.println("+--------+---------+--------------+");
+
+  for (int r = 1; r <= 3; r++) {
+    if (r == rower && fault != 0) {
+      const char *fb = fault == 1 ? "RED + VIBE"
+                     : fault == 2 ? "BLUE"
+                     : "VIBRATE";
+      Serial.printf("|   %d    | %-7s | %-12s |\n", r, faultShort(fault), fb);
+    } else {
+      Serial.printf("|   %d    | IN SYNC | GREEN        |\n", r);
+    }
+  }
+
+  Serial.println("+--------+---------+--------------+");
+  if (fault == 0) Serial.println("  CREW IS SYNCHRONISED");
+  else Serial.printf("  ROWER %d OUT OF SYNC  (%s)\n", rower, faultShort(fault));
+  Serial.println();
+}
+
 void applyDecision(int rower, int fault) {
+  showStatus(rower, fault);
+
   if (fault == 0 || rower == 0) {
-    Serial.println(">>> PI: 00   crew in sync, all bands GREEN");
     for (uint8_t r = 1; r <= 3; r++)
       sendDecision(r, STATUS_CORRECT, ERROR_NONE, LED_COMMAND_GREEN);
     return;
   }
-
-  Serial.printf(">>> PI: %d%d   ROWER %d  %s\n",
-                rower, fault, rower, faultName(fault));
 
   for (uint8_t r = 1; r <= 3; r++) {
     if (r == rower)
@@ -339,17 +384,27 @@ void loop() {
 
   pumpPi();
 
-  // One rower stopped mid batch. Do not wait forever, and do not leave a
-  // band stuck on RED with no decision coming to clear it.
-  if (batchOpen && millis() - batchStart > BATCH_TIMEOUT_MS) {
-    Serial.printf("batch timeout [%d %d %d]", count[0], count[1], count[2]);
-    for (int r = 0; r < 3; r++)
-      if (count[r] < STROKES) Serial.printf("  R%d is short", r + 1);
+  uint32_t now = millis();
+
+  // Send only when every rower has 3 recent strokes. A dropped packet just
+  // delays this batch; nobody's good data is thrown away.
+  if (newSinceSend && batchReady() && now - lastSend >= MIN_SEND_INTERVAL)
+    sendBatchToPi();
+
+  // Say something if we have been waiting a long time, so a silent band is
+  // visible instead of just looking like nothing is happening.
+  if (!warnedIncomplete && lastSend && now - lastSend > STALE_MS) {
+    Serial.print("waiting:");
+    for (int r = 0; r < 3; r++) {
+      if (have[r] < STROKES)
+        Serial.printf("  R%d has only %d/%d strokes", r + 1, have[r], STROKES);
+      else if (now - lastStroke[r] > STALE_MS)
+        Serial.printf("  R%d stopped rowing", r + 1);
+    }
     Serial.println();
+    warnedIncomplete = true;
 
-    for (uint8_t r = 1; r <= 3; r++)          // clear every band
+    for (uint8_t r = 1; r <= 3; r++)      // do not leave a band stuck on RED
       sendDecision(r, STATUS_CORRECT, ERROR_NONE, LED_COMMAND_GREEN);
-
-    resetBatch();
   }
 }
