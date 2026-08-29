@@ -1,0 +1,54 @@
+mac address find for central esp:
+
+
+#include <WiFi.h>
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  WiFi.mode(WIFI_STA);
+  delay(100);
+
+  Serial.println();
+  Serial.println("Central ESP32");
+
+  Serial.print("WiFi MAC Address: ");
+  Serial.println(WiFi.macAddress());
+}
+
+void loop() {
+}
+
+
+
+Central ESP32
+WiFi MAC Address: 94:54:C5:2F:27:28
+
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+
+slave mac address find code:
+
+#include <WiFi.h>
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  WiFi.mode(WIFI_STA);
+  delay(100);
+
+  Serial.println();
+  Serial.println("XIAO ESP32-C3");
+  Serial.print("MAC Address: ");
+  Serial.println(WiFi.macAddress());
+}
+
+void loop() {
+}
+
+Hello from Seeed Studio XIAO ESP32-C3
+
+XIAO ESP32-C3
+MAC Address: E8:F6:0A:14:5F:90
