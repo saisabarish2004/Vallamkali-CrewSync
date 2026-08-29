@@ -1,0 +1,1028 @@
+CENTRAL::
+
+
+
+#include <WiFi.h>
+#include <esp_now.h>
+
+
+// =====================================================
+// MOTION PACKET
+// XIAO -> CENTRAL
+// =====================================================
+
+typedef struct {
+
+  uint8_t rower_id;
+  uint32_t sequence;
+  uint32_t timestamp;
+
+  float ax;
+  float ay;
+  float az;
+
+  float gx;
+  float gy;
+  float gz;
+
+} MotionPacket;
+
+
+// =====================================================
+// COMMAND PACKET
+// CENTRAL -> XIAO
+// =====================================================
+//
+// instruction:
+// 1 = SPEED
+// 2 = TIME
+// 3 = RESET / LED OFF
+//
+// =====================================================
+
+typedef struct {
+
+  uint8_t rower_id;
+  uint8_t instruction;
+
+} CommandPacket;
+
+
+// =====================================================
+// XIAO MAC ADDRESSES
+// =====================================================
+
+uint8_t rower1MAC[] = {
+  0xE8, 0xF6, 0x0A, 0x14, 0x5F, 0x90
+};
+
+uint8_t rower2MAC[] = {
+  0xE8, 0xF6, 0x0A, 0x14, 0x32, 0x6C
+};
+
+uint8_t rower3MAC[] = {
+  0xE8, 0xF6, 0x0A, 0x15, 0x07, 0x7C
+};
+
+
+// =====================================================
+// ADD PEER
+// =====================================================
+
+void addPeer(uint8_t *mac) {
+
+  esp_now_peer_info_t peerInfo = {};
+
+  memcpy(
+    peerInfo.peer_addr,
+    mac,
+    6
+  );
+
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) == ESP_OK) {
+
+    Serial.println("Peer added");
+
+  } else {
+
+    Serial.println("Peer add failed");
+  }
+}
+
+
+// =====================================================
+// SEND CALLBACK
+// =====================================================
+
+void onDataSent(
+  const wifi_tx_info_t *info,
+  esp_now_send_status_t status
+) {
+
+  if (status == ESP_NOW_SEND_SUCCESS) {
+
+    Serial.println("Command ESP-NOW: SENT");
+
+  } else {
+
+    Serial.println("Command ESP-NOW: FAILED");
+  }
+}
+
+
+// =====================================================
+// RECEIVE MOTION PACKET
+// XIAO -> CENTRAL
+// =====================================================
+
+void onDataReceive(
+  const esp_now_recv_info_t *info,
+  const uint8_t *data,
+  int len
+) {
+
+  // Check packet size
+
+  if (len != sizeof(MotionPacket)) {
+
+    return;
+  }
+
+
+  MotionPacket packet;
+
+  memcpy(
+    &packet,
+    data,
+    sizeof(packet)
+  );
+
+
+  // =================================================
+  // DISPLAY MOTION DATA
+  // =================================================
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("     MOTION PACKET RECEIVED");
+  Serial.println("================================");
+
+
+  Serial.print("Rower ID  : ");
+  Serial.println(packet.rower_id);
+
+
+  Serial.print("Sequence  : ");
+  Serial.println(packet.sequence);
+
+
+  Serial.print("Timestamp : ");
+  Serial.println(packet.timestamp);
+
+
+  Serial.println();
+  Serial.println("Accel:");
+
+  Serial.print("AX: ");
+  Serial.println(packet.ax, 2);
+
+  Serial.print("AY: ");
+  Serial.println(packet.ay, 2);
+
+  Serial.print("AZ: ");
+  Serial.println(packet.az, 2);
+
+
+  Serial.println();
+  Serial.println("Gyro:");
+
+  Serial.print("GX: ");
+  Serial.println(packet.gx, 2);
+
+  Serial.print("GY: ");
+  Serial.println(packet.gy, 2);
+
+  Serial.print("GZ: ");
+  Serial.println(packet.gz, 2);
+
+
+  Serial.println("================================");
+}
+
+
+// =====================================================
+// SEND COMMAND TO ONE ROWER
+// =====================================================
+
+void sendCommand(
+  uint8_t rowerID,
+  uint8_t instruction
+) {
+
+  CommandPacket command;
+
+  command.rower_id = rowerID;
+  command.instruction = instruction;
+
+
+  uint8_t *mac;
+
+
+  // =================================================
+  // SELECT ROWER
+  // =================================================
+
+  if (rowerID == 1) {
+
+    mac = rower1MAC;
+
+  }
+
+  else if (rowerID == 2) {
+
+    mac = rower2MAC;
+
+  }
+
+  else if (rowerID == 3) {
+
+    mac = rower3MAC;
+
+  }
+
+  else {
+
+    Serial.println("Invalid Rower ID");
+
+    return;
+  }
+
+
+  // =================================================
+  // SEND COMMAND
+  // =================================================
+
+  esp_err_t result = esp_now_send(
+    mac,
+    (uint8_t *)&command,
+    sizeof(command)
+  );
+
+
+  // =================================================
+  // DISPLAY COMMAND
+  // =================================================
+
+  Serial.println();
+  Serial.println("--------------------------------");
+  Serial.println("COMMAND SENT");
+  Serial.println("--------------------------------");
+
+  Serial.print("Rower ID    : ");
+  Serial.println(rowerID);
+
+  Serial.print("Instruction : ");
+
+
+  if (instruction == 1) {
+
+    Serial.println("SPEED");
+
+  }
+
+  else if (instruction == 2) {
+
+    Serial.println("TIME");
+
+  }
+
+  else if (instruction == 3) {
+
+    Serial.println("RESET");
+
+  }
+
+
+  if (result == ESP_OK) {
+
+    Serial.println("Status      : QUEUED");
+
+  } else {
+
+    Serial.println("Status      : ERROR");
+  }
+
+  Serial.println("--------------------------------");
+}
+
+
+// =====================================================
+// RESET ALL ROWERS
+// =====================================================
+
+void resetAllRowers() {
+
+  CommandPacket command;
+
+  command.instruction = 3;
+
+
+  // =================================================
+  // ROWER 1
+  // =================================================
+
+  command.rower_id = 1;
+
+  esp_now_send(
+    rower1MAC,
+    (uint8_t *)&command,
+    sizeof(command)
+  );
+
+
+  // =================================================
+  // ROWER 2
+  // =================================================
+
+  command.rower_id = 2;
+
+  esp_now_send(
+    rower2MAC,
+    (uint8_t *)&command,
+    sizeof(command)
+  );
+
+
+  // =================================================
+  // ROWER 3
+  // =================================================
+
+  command.rower_id = 3;
+
+  esp_now_send(
+    rower3MAC,
+    (uint8_t *)&command,
+    sizeof(command)
+  );
+
+
+  // =================================================
+  // DISPLAY
+  // =================================================
+
+  Serial.println();
+  Serial.println("==============================");
+  Serial.println("      RESET ALL ROWERS");
+  Serial.println("==============================");
+
+  Serial.println("Rower 1 -> LED OFF");
+  Serial.println("Rower 2 -> LED OFF");
+  Serial.println("Rower 3 -> LED OFF");
+
+  Serial.println("==============================");
+}
+
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(1000);
+
+
+  // =================================================
+  // WIFI
+  // =================================================
+
+  WiFi.mode(WIFI_STA);
+
+
+  // =================================================
+  // CENTRAL INFORMATION
+  // =================================================
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("          CENTRAL ESP32");
+  Serial.println("================================");
+
+  Serial.print("Central MAC: ");
+  Serial.println(WiFi.macAddress());
+
+
+  // =================================================
+  // ESP-NOW INITIALIZATION
+  // =================================================
+
+  if (esp_now_init() != ESP_OK) {
+
+    Serial.println(
+      "ESP-NOW initialization FAILED"
+    );
+
+    return;
+  }
+
+  Serial.println(
+    "ESP-NOW initialized"
+  );
+
+
+  // =================================================
+  // CALLBACKS
+  // =================================================
+
+  esp_now_register_send_cb(
+    onDataSent
+  );
+
+  esp_now_register_recv_cb(
+    onDataReceive
+  );
+
+
+  // =================================================
+  // ADD ALL ROWERS
+  // =================================================
+
+  Serial.println();
+  Serial.println("Adding rowers...");
+
+  addPeer(rower1MAC);
+  addPeer(rower2MAC);
+  addPeer(rower3MAC);
+
+
+  // =================================================
+  // READY
+  // =================================================
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("              READY");
+  Serial.println("================================");
+
+  Serial.println("Commands:");
+
+  Serial.println();
+
+  Serial.println("1.speed");
+  Serial.println("2.speed");
+  Serial.println("3.speed");
+
+  Serial.println();
+
+  Serial.println("1.time");
+  Serial.println("2.time");
+  Serial.println("3.time");
+
+  Serial.println();
+
+  Serial.println("reset  -> ALL ROWERS LED OFF");
+
+  Serial.println();
+
+  Serial.println("================================");
+}
+
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop() {
+
+  // =================================================
+  // CHECK SERIAL COMMAND
+  // =================================================
+
+  if (Serial.available()) {
+
+    String input =
+      Serial.readStringUntil('\n');
+
+    input.trim();
+    input.toLowerCase();
+
+
+    // =================================================
+    // COMMON RESET
+    // =================================================
+
+    if (input == "reset") {
+
+      resetAllRowers();
+
+      return;
+    }
+
+
+    // =================================================
+    // FIND "."
+    // =================================================
+
+    int dot =
+      input.indexOf('.');
+
+
+    if (dot == -1) {
+
+      Serial.println(
+        "Invalid format"
+      );
+
+      return;
+    }
+
+
+    // =================================================
+    // GET ROWER ID
+    // =================================================
+
+    int rowerID =
+      input.substring(
+        0,
+        dot
+      ).toInt();
+
+
+    // =================================================
+    // GET INSTRUCTION
+    // =================================================
+
+    String instructionText =
+      input.substring(
+        dot + 1
+      );
+
+
+    uint8_t instruction;
+
+
+    // =================================================
+    // SPEED
+    // =================================================
+
+    if (instructionText == "speed") {
+
+      instruction = 1;
+    }
+
+
+    // =================================================
+    // TIME
+    // =================================================
+
+    else if (instructionText == "time") {
+
+      instruction = 2;
+    }
+
+
+    // =================================================
+    // INVALID COMMAND
+    // =================================================
+
+    else {
+
+      Serial.println(
+        "Unknown instruction"
+      );
+
+      return;
+    }
+
+
+    // =================================================
+    // SEND COMMAND
+    // =================================================
+
+    sendCommand(
+      rowerID,
+      instruction
+    );
+  }
+}
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+
+ROVER :
+
+
+#include <WiFi.h>
+#include <esp_now.h>
+
+
+// =====================================================
+// CHANGE THIS FOR EACH XIAO
+// =====================================================
+
+#define ROWER_ID 1
+
+
+// =====================================================
+// CENTRAL ESP32 MAC ADDRESS
+// =====================================================
+
+uint8_t centralMAC[] = {
+  0x94, 0x54, 0xC5, 0x2F, 0x27, 0x28
+};
+
+
+// =====================================================
+// RGB LED PINS
+// =====================================================
+
+#define RED_PIN    3
+#define GREEN_PIN  4
+#define BLUE_PIN   5
+
+
+// =====================================================
+// MOTION PACKET
+// XIAO -> CENTRAL
+// =====================================================
+
+typedef struct {
+
+  uint8_t rower_id;
+
+  uint32_t sequence;
+
+  uint32_t timestamp;
+
+  float ax;
+  float ay;
+  float az;
+
+  float gx;
+  float gy;
+  float gz;
+
+} MotionPacket;
+
+
+MotionPacket motionPacket;
+
+uint32_t sequenceNumber = 0;
+
+
+// =====================================================
+// COMMAND PACKET
+// CENTRAL -> XIAO
+// =====================================================
+//
+// instruction:
+// 1 = SPEED
+// 2 = TIME
+// 3 = RESET / LED OFF
+//
+// =====================================================
+
+typedef struct {
+
+  uint8_t rower_id;
+
+  uint8_t instruction;
+
+} CommandPacket;
+
+
+CommandPacket command;
+
+
+// =====================================================
+// RED LED
+// =====================================================
+
+void redLED() {
+
+  digitalWrite(
+    RED_PIN,
+    HIGH
+  );
+
+  digitalWrite(
+    GREEN_PIN,
+    LOW
+  );
+
+  digitalWrite(
+    BLUE_PIN,
+    LOW
+  );
+}
+
+
+// =====================================================
+// GREEN LED
+// =====================================================
+
+void greenLED() {
+
+  digitalWrite(
+    RED_PIN,
+    LOW
+  );
+
+  digitalWrite(
+    GREEN_PIN,
+    HIGH
+  );
+
+  digitalWrite(
+    BLUE_PIN,
+    LOW
+  );
+}
+
+
+// =====================================================
+// BLUE LED
+// =====================================================
+
+void blueLED() {
+
+  digitalWrite(
+    RED_PIN,
+    LOW
+  );
+
+  digitalWrite(
+    GREEN_PIN,
+    LOW
+  );
+
+  digitalWrite(
+    BLUE_PIN,
+    HIGH
+  );
+}
+
+
+// =====================================================
+// LED OFF
+// =====================================================
+
+void offLED() {
+
+  digitalWrite(
+    RED_PIN,
+    LOW
+  );
+
+  digitalWrite(
+    GREEN_PIN,
+    LOW
+  );
+
+  digitalWrite(
+    BLUE_PIN,
+    LOW
+  );
+}
+
+
+// =====================================================
+// RECEIVE COMMAND
+// CENTRAL -> XIAO
+// =====================================================
+
+void onDataReceive(
+  const esp_now_recv_info_t *info,
+  const uint8_t *data,
+  int len
+) {
+
+  // =================================================
+  // CHECK PACKET SIZE
+  // =================================================
+
+  if (len != sizeof(CommandPacket)) {
+
+    return;
+  }
+
+
+  // =================================================
+  // COPY COMMAND
+  // =================================================
+
+  memcpy(
+    &command,
+    data,
+    sizeof(command)
+  );
+
+
+  // =================================================
+  // IGNORE OTHER ROWERS
+  // =================================================
+
+  if (command.rower_id != ROWER_ID) {
+
+    return;
+  }
+
+
+  // =================================================
+  // SPEED -> RED
+  // =================================================
+
+  if (command.instruction == 1) {
+
+    redLED();
+  }
+
+
+  // =================================================
+  // TIME -> GREEN
+  // =================================================
+
+  else if (command.instruction == 2) {
+
+    greenLED();
+  }
+
+
+  // =================================================
+  // RESET -> OFF
+  // =================================================
+
+  else if (command.instruction == 3) {
+
+    offLED();
+  }
+
+
+  // =================================================
+  // UNKNOWN -> OFF
+  // =================================================
+
+  else {
+
+    offLED();
+  }
+}
+
+
+// =====================================================
+// SEND CALLBACK
+// =====================================================
+
+void onDataSent(
+  const wifi_tx_info_t *info,
+  esp_now_send_status_t status
+) {
+
+  // No Serial printing.
+  // Keeps the XIAO communication fast.
+}
+
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  // =================================================
+  // RGB LED
+  // =================================================
+
+  pinMode(
+    RED_PIN,
+    OUTPUT
+  );
+
+  pinMode(
+    GREEN_PIN,
+    OUTPUT
+  );
+
+  pinMode(
+    BLUE_PIN,
+    OUTPUT
+  );
+
+
+  // LED initially OFF
+
+  offLED();
+
+
+  // =================================================
+  // WIFI
+  // =================================================
+
+  WiFi.mode(
+    WIFI_STA
+  );
+
+
+  // =================================================
+  // ESP-NOW INITIALIZATION
+  // =================================================
+
+  if (
+    esp_now_init() != ESP_OK
+  ) {
+
+    return;
+  }
+
+
+  // =================================================
+  // RECEIVE CALLBACK
+  // =================================================
+
+  esp_now_register_recv_cb(
+    onDataReceive
+  );
+
+
+  // =================================================
+  // SEND CALLBACK
+  // =================================================
+
+  esp_now_register_send_cb(
+    onDataSent
+  );
+
+
+  // =================================================
+  // ADD CENTRAL AS PEER
+  // =================================================
+
+  esp_now_peer_info_t peerInfo = {};
+
+
+  memcpy(
+    peerInfo.peer_addr,
+    centralMAC,
+    6
+  );
+
+
+  peerInfo.channel = 0;
+
+  peerInfo.encrypt = false;
+
+
+  esp_now_add_peer(
+    &peerInfo
+  );
+}
+
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop() {
+
+  // =================================================
+  // CREATE MOTION PACKET
+  // =================================================
+
+  motionPacket.rower_id =
+    ROWER_ID;
+
+
+  motionPacket.sequence =
+    sequenceNumber++;
+
+
+  motionPacket.timestamp =
+    millis();
+
+
+  // =================================================
+  // FAKE IMU DATA
+  // Replace with real IMU later
+  // =================================================
+
+  motionPacket.ax = 1.2;
+
+  motionPacket.ay = 0.4;
+
+  motionPacket.az = 9.8;
+
+
+  motionPacket.gx = 0.1;
+
+  motionPacket.gy = 0.2;
+
+  motionPacket.gz = 0.3;
+
+
+  // =================================================
+  // SEND MOTION PACKET
+  // XIAO -> CENTRAL
+  // =================================================
+
+  esp_now_send(
+
+    centralMAC,
+
+    (uint8_t *)&motionPacket,
+
+    sizeof(motionPacket)
+
+  );
+
+
+  // =================================================
+  // TRANSMIT EVERY 500 ms
+  // =================================================
+
+  delay(500);
+}
