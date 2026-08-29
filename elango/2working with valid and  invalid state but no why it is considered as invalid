@@ -1,0 +1,564 @@
+#include <Wire.h>
+#include <math.h>
+
+// =====================================================
+// MPU6050
+// =====================================================
+#define MPU_ADDR       0x68
+#define ACCEL_XOUT_H   0x3B
+#define GYRO_XOUT_H    0x43
+#define PWR_MGMT_1     0x6B
+
+// =====================================================
+// ROWER
+// =====================================================
+#define ROWER_ID 1
+
+// =====================================================
+// CALIBRATION VALUES
+// DO NOT CHANGE
+// =====================================================
+const float ACCEL_SCALE_X = 16384.0;
+const float ACCEL_SCALE_Y = 16384.0;
+
+const float Z_OFFSET = 3029.0;
+const float Z_SCALE  = 16448.0;
+
+const float GYRO_BIAS_X = 1.93;
+const float GYRO_BIAS_Y = 0.76;
+const float GYRO_BIAS_Z = -0.27;
+
+const float GYRO_SCALE = 131.0;
+
+const float GRAVITY = 9.80665;
+
+// =====================================================
+// STROKE DETECTION
+// =====================================================
+
+// Initial stationary calibration
+const unsigned long CALIBRATION_TIME = 5000;
+
+// Wait after calibration
+const unsigned long START_DELAY = 1000;
+
+// Movement required to START possible stroke
+const float START_ACC_THRESHOLD  = 2.0;
+const float START_GYRO_THRESHOLD = 20.0;
+
+// Movement considered quiet
+const float END_ACC_THRESHOLD  = 1.2;
+const float END_GYRO_THRESHOLD = 10.0;
+
+// Consecutive quiet samples required
+const int END_STABLE_COUNT = 8;
+
+// =====================================================
+// FALSE STROKE FILTER
+// =====================================================
+
+// Minimum time for a valid stroke
+const unsigned long MIN_STROKE_DURATION = 500;
+
+// Minimum acceleration for a valid stroke
+const float MIN_PEAK_ACC = 4.0;
+
+// Minimum gyro for a valid stroke
+const float MIN_PEAK_GYRO = 50.0;
+
+// =====================================================
+// VARIABLES
+// =====================================================
+
+uint32_t strokeID = 1;
+
+float baseAX = 0;
+float baseAY = 0;
+float baseAZ = 0;
+
+bool calibrated = false;
+bool waitingForStroke = false;
+bool strokeActive = false;
+
+unsigned long calibrationStart = 0;
+unsigned long waitStart = 0;
+unsigned long strokeStartTime = 0;
+
+int stableCount = 0;
+
+float peakAcc = 0;
+float peakGyro = 0;
+
+float strokeStartAngle = 0;
+float strokeEndAngle = 0;
+
+// =====================================================
+// READ 16-BIT VALUE
+// =====================================================
+
+int16_t read16(uint8_t reg)
+{
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+
+  Wire.requestFrom(MPU_ADDR, (uint8_t)2);
+
+  if (Wire.available() < 2)
+  {
+    return 0;
+  }
+
+  uint8_t highByte = Wire.read();
+  uint8_t lowByte  = Wire.read();
+
+  return (int16_t)((highByte << 8) | lowByte);
+}
+
+// =====================================================
+// WRITE MPU REGISTER
+// =====================================================
+
+void writeRegister(uint8_t reg, uint8_t value)
+{
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission();
+}
+
+// =====================================================
+// READ SENSOR
+// =====================================================
+
+void readSensor(
+  float &ax,
+  float &ay,
+  float &az,
+  float &gx,
+  float &gy,
+  float &gz
+)
+{
+  int16_t rawAX = read16(ACCEL_XOUT_H);
+  int16_t rawAY = read16(ACCEL_XOUT_H + 2);
+  int16_t rawAZ = read16(ACCEL_XOUT_H + 4);
+
+  int16_t rawGX = read16(GYRO_XOUT_H);
+  int16_t rawGY = read16(GYRO_XOUT_H + 2);
+  int16_t rawGZ = read16(GYRO_XOUT_H + 4);
+
+  // -----------------------------
+  // Accelerometer
+  // -----------------------------
+
+  ax = (rawAX / ACCEL_SCALE_X) * GRAVITY;
+  ay = (rawAY / ACCEL_SCALE_Y) * GRAVITY;
+
+  float zG = (rawAZ - Z_OFFSET) / Z_SCALE;
+  az = zG * GRAVITY;
+
+  // -----------------------------
+  // Gyroscope
+  // -----------------------------
+
+  gx = (rawGX / GYRO_SCALE) - GYRO_BIAS_X;
+  gy = (rawGY / GYRO_SCALE) - GYRO_BIAS_Y;
+  gz = (rawGZ / GYRO_SCALE) - GYRO_BIAS_Z;
+}
+
+// =====================================================
+// ACCELERATION MAGNITUDE
+// =====================================================
+
+float getAccelerationMagnitude(
+  float ax,
+  float ay,
+  float az
+)
+{
+  return sqrt(
+    ax * ax +
+    ay * ay +
+    az * az
+  );
+}
+
+// =====================================================
+// GYRO MAGNITUDE
+// =====================================================
+
+float getGyroMagnitude(
+  float gx,
+  float gy,
+  float gz
+)
+{
+  return sqrt(
+    gx * gx +
+    gy * gy +
+    gz * gz
+  );
+}
+
+// =====================================================
+// ANGLE
+// =====================================================
+
+float calculateAngle(
+  float ax,
+  float ay,
+  float az
+)
+{
+  float angle = atan2(
+    sqrt(ax * ax + ay * ay),
+    fabs(az)
+  );
+
+  return angle * 180.0 / PI;
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  delay(2000);
+
+  // XIAO ESP32 I2C
+  Wire.begin(21, 22);
+
+  // Wake MPU6050
+  writeRegister(PWR_MGMT_1, 0x00);
+
+  delay(1000);
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("      WEARABLE STROKE DETECTOR");
+  Serial.println("========================================");
+
+  Serial.print("Rower ID: ");
+  Serial.println(ROWER_ID);
+
+  Serial.println();
+  Serial.println("Keep sensor STILL for 5 seconds...");
+  Serial.println();
+
+  calibrationStart = millis();
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop()
+{
+  float ax, ay, az;
+  float gx, gy, gz;
+
+  readSensor(
+    ax, ay, az,
+    gx, gy, gz
+  );
+
+  unsigned long now = millis();
+
+  // ===================================================
+  // STEP 1
+  // 5 SECOND STATIONARY CALIBRATION
+  // ===================================================
+
+  if (!calibrated)
+  {
+    static float sumAX = 0;
+    static float sumAY = 0;
+    static float sumAZ = 0;
+
+    static int samples = 0;
+
+    sumAX += ax;
+    sumAY += ay;
+    sumAZ += az;
+
+    samples++;
+
+    if (now - calibrationStart >= CALIBRATION_TIME)
+    {
+      baseAX = sumAX / samples;
+      baseAY = sumAY / samples;
+      baseAZ = sumAZ / samples;
+
+      calibrated = true;
+      waitingForStroke = true;
+
+      waitStart = now;
+
+      Serial.println("========================================");
+      Serial.println("CALIBRATION COMPLETE");
+      Serial.println("========================================");
+
+      Serial.print("Baseline AX: ");
+      Serial.println(baseAX, 3);
+
+      Serial.print("Baseline AY: ");
+      Serial.println(baseAY, 3);
+
+      Serial.print("Baseline AZ: ");
+      Serial.println(baseAZ, 3);
+
+      Serial.println();
+      Serial.println("Waiting 1 second...");
+    }
+
+    delay(20);
+    return;
+  }
+
+  // ===================================================
+  // STEP 2
+  // WAIT AFTER CALIBRATION
+  // ===================================================
+
+  if (waitingForStroke)
+  {
+    if (now - waitStart >= START_DELAY)
+    {
+      waitingForStroke = false;
+
+      Serial.println();
+      Serial.println("========================================");
+      Serial.println("READY FOR STROKE");
+      Serial.println("========================================");
+
+      Serial.println("Perform ONE stroke...");
+    }
+
+    delay(20);
+    return;
+  }
+
+  // ===================================================
+  // CALCULATE MOVEMENT
+  // ===================================================
+
+  float accMagnitude =
+    getAccelerationMagnitude(ax, ay, az);
+
+  float gyroMagnitude =
+    getGyroMagnitude(gx, gy, gz);
+
+  // Difference from gravity
+  float accMovement =
+    fabs(accMagnitude - GRAVITY);
+
+  // ===================================================
+  // STEP 3
+  // DETECT POSSIBLE STROKE START
+  // ===================================================
+
+  if (!strokeActive)
+  {
+    if (
+      accMovement > START_ACC_THRESHOLD ||
+      gyroMagnitude > START_GYRO_THRESHOLD
+    )
+    {
+      strokeActive = true;
+
+      strokeStartTime = now;
+
+      peakAcc = accMovement;
+      peakGyro = gyroMagnitude;
+
+      strokeStartAngle =
+        calculateAngle(ax, ay, az);
+
+      strokeEndAngle =
+        strokeStartAngle;
+
+      stableCount = 0;
+
+      Serial.println();
+      Serial.println(">>> POSSIBLE STROKE START <<<");
+    }
+
+    delay(20);
+    return;
+  }
+
+  // ===================================================
+  // STEP 4
+  // STROKE ACTIVE
+  // ===================================================
+
+  if (accMovement > peakAcc)
+  {
+    peakAcc = accMovement;
+  }
+
+  if (gyroMagnitude > peakGyro)
+  {
+    peakGyro = gyroMagnitude;
+  }
+
+  strokeEndAngle =
+    calculateAngle(ax, ay, az);
+
+  // ===================================================
+  // CHECK FOR END OF STROKE
+  // ===================================================
+
+  if (
+    accMovement < END_ACC_THRESHOLD &&
+    gyroMagnitude < END_GYRO_THRESHOLD
+  )
+  {
+    stableCount++;
+  }
+  else
+  {
+    stableCount = 0;
+  }
+
+  // ===================================================
+  // STEP 5
+  // STROKE FINISHED
+  // ===================================================
+
+  if (stableCount >= END_STABLE_COUNT)
+  {
+    unsigned long duration =
+      now - strokeStartTime;
+
+    float angle =
+      fabs(strokeEndAngle - strokeStartAngle);
+
+    if (angle > 180.0)
+    {
+      angle = 180.0;
+    }
+
+    // =================================================
+    // VALIDATE STROKE
+    // =================================================
+
+    bool validDuration =
+      duration >= MIN_STROKE_DURATION;
+
+    bool validAcceleration =
+      peakAcc >= MIN_PEAK_ACC;
+
+    bool validGyro =
+      peakGyro >= MIN_PEAK_GYRO;
+
+    bool validStroke =
+      validDuration &&
+      (validAcceleration || validGyro);
+
+    // =================================================
+    // VALID STROKE
+    // =================================================
+
+    if (validStroke)
+    {
+      Serial.println();
+      Serial.println("========================================");
+      Serial.println("         VALID STROKE");
+      Serial.println("========================================");
+
+      Serial.print("Stroke ID: ");
+      Serial.println(strokeID);
+
+      Serial.print("Duration: ");
+      Serial.print(duration);
+      Serial.println(" ms");
+
+      Serial.print("Peak Acceleration: ");
+      Serial.print(peakAcc, 3);
+      Serial.println(" m/s^2");
+
+      Serial.print("Peak Gyroscope: ");
+      Serial.print(peakGyro, 3);
+      Serial.println(" deg/s");
+
+      Serial.print("Angle: ");
+      Serial.print(angle, 2);
+      Serial.println(" deg");
+
+      Serial.println();
+
+      // ===============================================
+      // FINAL PROTOCOL PACKET
+      // ===============================================
+
+      Serial.print("STROKE,");
+      Serial.print(ROWER_ID);
+      Serial.print(",");
+      Serial.print(strokeID);
+      Serial.print(",");
+      Serial.print(duration);
+      Serial.print(",");
+      Serial.print(peakAcc, 3);
+      Serial.print(",");
+      Serial.print(peakGyro, 3);
+      Serial.print(",");
+      Serial.println(angle, 2);
+
+      Serial.println();
+
+      strokeID++;
+    }
+
+    // =================================================
+    // INVALID / NOISE
+    // =================================================
+
+    else
+    {
+      Serial.println();
+      Serial.println("----------------------------------------");
+      Serial.println("        MOVEMENT IGNORED");
+      Serial.println("----------------------------------------");
+
+      Serial.print("Duration: ");
+      Serial.print(duration);
+      Serial.println(" ms");
+
+      Serial.print("Peak Acceleration: ");
+      Serial.print(peakAcc, 3);
+      Serial.println(" m/s^2");
+
+      Serial.print("Peak Gyroscope: ");
+      Serial.print(peakGyro, 3);
+      Serial.println(" deg/s");
+
+      Serial.println("Reason: movement did not qualify as a stroke.");
+      Serial.println();
+    }
+
+    // =================================================
+    // RESET
+    // =================================================
+
+    strokeActive = false;
+
+    stableCount = 0;
+
+    peakAcc = 0;
+    peakGyro = 0;
+
+    strokeStartAngle = 0;
+    strokeEndAngle = 0;
+
+    delay(500);
+
+    Serial.println("Ready for next stroke...");
+  }
+
+  delay(20);
+}
