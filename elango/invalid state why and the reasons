@@ -1,0 +1,477 @@
+#include <Wire.h>
+#include <math.h>
+
+// =====================================================
+// MPU6050
+// =====================================================
+
+#define MPU_ADDR 0x68
+
+#define ACCEL_XOUT_H 0x3B
+#define GYRO_XOUT_H  0x43
+#define PWR_MGMT_1   0x6B
+
+// =====================================================
+// ROWER
+// =====================================================
+
+#define ROWER_ID 1
+
+// =====================================================
+// GRAVITY
+// =====================================================
+
+const float GRAVITY = 9.80665;
+
+// =====================================================
+// ACCELEROMETER CALIBRATION
+// Keep your calibrated values
+// =====================================================
+
+const float ACCEL_SCALE_X = 16384.0;
+const float ACCEL_SCALE_Y = 16384.0;
+
+const float Z_OFFSET = 3029.0;
+const float Z_SCALE  = 16448.0;
+
+// =====================================================
+// GYROSCOPE CALIBRATION
+// =====================================================
+
+const float GYRO_BIAS_X = 1.93;
+const float GYRO_BIAS_Y = 0.76;
+const float GYRO_BIAS_Z = -0.27;
+
+const float GYRO_SCALE = 131.0;
+
+// =====================================================
+// STROKE DETECTION SETTINGS
+// =====================================================
+
+// Strong movement required to START a stroke
+const float START_ACC_THRESHOLD  = 4.0;
+const float START_GYRO_THRESHOLD = 50.0;
+
+// Minimum duration for a valid stroke
+const unsigned long MIN_STROKE_DURATION = 500;
+
+// Validation thresholds
+const float MIN_PEAK_ACC  = 4.0;
+const float MIN_PEAK_GYRO = 50.0;
+
+// Maximum time allowed for one movement
+const unsigned long MAX_STROKE_DURATION = 3000;
+
+// =====================================================
+// VARIABLES
+// =====================================================
+
+bool strokeActive = false;
+
+unsigned long strokeStartTime = 0;
+
+float peakAcceleration = 0.0;
+float peakGyroscope = 0.0;
+
+float startAx = 0.0;
+float startAy = 0.0;
+float startAz = 0.0;
+
+uint32_t strokeID = 0;
+
+// =====================================================
+// READ 16-BIT VALUE
+// =====================================================
+
+int16_t read16(uint8_t reg)
+{
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+
+  Wire.requestFrom(MPU_ADDR, (uint8_t)2);
+
+  if (Wire.available() < 2)
+  {
+    return 0;
+  }
+
+  uint8_t highByte = Wire.read();
+  uint8_t lowByte  = Wire.read();
+
+  return (int16_t)((highByte << 8) | lowByte);
+}
+
+// =====================================================
+// WRITE MPU REGISTER
+// =====================================================
+
+void writeRegister(uint8_t reg, uint8_t value)
+{
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission();
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  delay(2000);
+
+  Wire.begin(21, 22);
+
+  // Wake MPU6050
+  writeRegister(PWR_MGMT_1, 0x00);
+
+  delay(1000);
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("       WEARABLE STROKE DETECTOR");
+  Serial.println("========================================");
+
+  Serial.print("Rower ID: ");
+  Serial.println(ROWER_ID);
+
+  Serial.println();
+
+  Serial.println("Stroke requirements:");
+  Serial.println("Minimum Duration : 500 ms");
+  Serial.println("Minimum Accel    : 4.0 m/s^2");
+  Serial.println("Minimum Gyro     : 50.0 deg/s");
+
+  Serial.println();
+
+  Serial.println("Waiting for movement...");
+  Serial.println();
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop()
+{
+  // ---------------------------------------------------
+  // READ RAW ACCELEROMETER
+  // ---------------------------------------------------
+
+  int16_t rawAX = read16(ACCEL_XOUT_H);
+  int16_t rawAY = read16(ACCEL_XOUT_H + 2);
+  int16_t rawAZ = read16(ACCEL_XOUT_H + 4);
+
+  // ---------------------------------------------------
+  // READ RAW GYROSCOPE
+  // ---------------------------------------------------
+
+  int16_t rawGX = read16(GYRO_XOUT_H);
+  int16_t rawGY = read16(GYRO_XOUT_H + 2);
+  int16_t rawGZ = read16(GYRO_XOUT_H + 4);
+
+  // ---------------------------------------------------
+  // CALIBRATE ACCELEROMETER
+  // ---------------------------------------------------
+
+  float ax =
+      (rawAX / ACCEL_SCALE_X) * GRAVITY;
+
+  float ay =
+      (rawAY / ACCEL_SCALE_Y) * GRAVITY;
+
+  float zG =
+      (rawAZ - Z_OFFSET) / Z_SCALE;
+
+  float az =
+      zG * GRAVITY;
+
+  // ---------------------------------------------------
+  // CALIBRATE GYROSCOPE
+  // ---------------------------------------------------
+
+  float gx =
+      (rawGX / GYRO_SCALE) - GYRO_BIAS_X;
+
+  float gy =
+      (rawGY / GYRO_SCALE) - GYRO_BIAS_Y;
+
+  float gz =
+      (rawGZ / GYRO_SCALE) - GYRO_BIAS_Z;
+
+  // ---------------------------------------------------
+  // CALCULATE TOTAL ACCELERATION
+  // ---------------------------------------------------
+
+  float accelerationMagnitude =
+      sqrt(
+        ax * ax +
+        ay * ay +
+        az * az
+      );
+
+  // Remove gravity
+
+  float dynamicAcceleration =
+      fabs(accelerationMagnitude - GRAVITY);
+
+  // ---------------------------------------------------
+  // CALCULATE TOTAL GYRO
+  // ---------------------------------------------------
+
+  float gyroMagnitude =
+      sqrt(
+        gx * gx +
+        gy * gy +
+        gz * gz
+      );
+
+  // ===================================================
+  // STROKE START DETECTION
+  // ===================================================
+
+  if (!strokeActive)
+  {
+    bool strongAcceleration =
+        dynamicAcceleration >= START_ACC_THRESHOLD;
+
+    bool strongGyroscope =
+        gyroMagnitude >= START_GYRO_THRESHOLD;
+
+    // Start only when strong movement happens
+
+    if (strongAcceleration || strongGyroscope)
+    {
+      strokeActive = true;
+
+      strokeStartTime = millis();
+
+      peakAcceleration = dynamicAcceleration;
+
+      peakGyroscope = gyroMagnitude;
+
+      startAx = ax;
+      startAy = ay;
+      startAz = az;
+
+      Serial.println();
+      Serial.println(">>> POSSIBLE STROKE START <<<");
+    }
+  }
+
+  // ===================================================
+  // STROKE ACTIVE
+  // ===================================================
+
+  else
+  {
+    // -------------------------------------------------
+    // UPDATE PEAK VALUES
+    // -------------------------------------------------
+
+    if (dynamicAcceleration > peakAcceleration)
+    {
+      peakAcceleration = dynamicAcceleration;
+    }
+
+    if (gyroMagnitude > peakGyroscope)
+    {
+      peakGyroscope = gyroMagnitude;
+    }
+
+    // -------------------------------------------------
+    // STROKE DURATION
+    // -------------------------------------------------
+
+    unsigned long duration =
+        millis() - strokeStartTime;
+
+    // -------------------------------------------------
+    // MOVEMENT FINISHED
+    // -------------------------------------------------
+
+    bool movementStopped =
+        dynamicAcceleration < 1.5 &&
+        gyroMagnitude < 15.0;
+
+    bool timeout =
+        duration >= MAX_STROKE_DURATION;
+
+    if (movementStopped || timeout)
+    {
+      // ===============================================
+      // VALIDATION
+      // ===============================================
+
+      bool validDuration =
+          duration >= MIN_STROKE_DURATION;
+
+      bool validAcceleration =
+          peakAcceleration >= MIN_PEAK_ACC;
+
+      bool validGyroscope =
+          peakGyroscope >= MIN_PEAK_GYRO;
+
+      bool validStroke =
+          validDuration &&
+          (validAcceleration || validGyroscope);
+
+      // ===============================================
+      // ANGLE CALCULATION
+      // ===============================================
+
+      float angle =
+          atan2(
+            sqrt(startAx * startAx +
+                 startAy * startAy),
+            fabs(startAz)
+          ) * 180.0 / PI;
+
+      // ===============================================
+      // VALID STROKE
+      // ===============================================
+
+      if (validStroke)
+      {
+        strokeID++;
+
+        Serial.println();
+        Serial.println("========================================");
+        Serial.println("           VALID STROKE");
+        Serial.println("========================================");
+
+        Serial.print("Stroke ID: ");
+        Serial.println(strokeID);
+
+        Serial.print("Duration: ");
+        Serial.print(duration);
+        Serial.println(" ms");
+
+        Serial.print("Peak Acceleration: ");
+        Serial.print(peakAcceleration, 3);
+        Serial.println(" m/s^2");
+
+        Serial.print("Peak Gyroscope: ");
+        Serial.print(peakGyroscope, 3);
+        Serial.println(" deg/s");
+
+        Serial.print("Angle: ");
+        Serial.print(angle, 2);
+        Serial.println(" deg");
+
+        Serial.println();
+
+        // =============================================
+        // FINAL PROTOCOL PACKET
+        // =============================================
+
+        Serial.print("STROKE,");
+        Serial.print(ROWER_ID);
+        Serial.print(",");
+        Serial.print(strokeID);
+        Serial.print(",");
+        Serial.print(duration);
+        Serial.print(",");
+        Serial.print(peakAcceleration, 3);
+        Serial.print(",");
+        Serial.print(peakGyroscope, 3);
+        Serial.print(",");
+        Serial.println(angle, 2);
+
+        Serial.println();
+        Serial.println("Ready for next stroke...");
+      }
+
+      // ===============================================
+      // INVALID STROKE
+      // ===============================================
+
+      else
+      {
+        Serial.println();
+        Serial.println("========================================");
+        Serial.println("          INVALID STROKE");
+        Serial.println("========================================");
+
+        Serial.print("Duration: ");
+        Serial.print(duration);
+        Serial.println(" ms");
+
+        Serial.print("Peak Acceleration: ");
+        Serial.print(peakAcceleration, 3);
+        Serial.println(" m/s^2");
+
+        Serial.print("Peak Gyroscope: ");
+        Serial.print(peakGyroscope, 3);
+        Serial.println(" deg/s");
+
+        Serial.println();
+        Serial.println("REASON:");
+
+        // ---------------------------------------------
+        // Duration reason
+        // ---------------------------------------------
+
+        if (!validDuration)
+        {
+          Serial.print("- Duration too short (");
+          Serial.print(duration);
+          Serial.println(" ms < 500 ms)");
+        }
+
+        // ---------------------------------------------
+        // Acceleration reason
+        // ---------------------------------------------
+
+        if (!validAcceleration)
+        {
+          Serial.print("- Acceleration too low (");
+          Serial.print(peakAcceleration, 2);
+          Serial.println(" < 4.0 m/s^2)");
+        }
+
+        // ---------------------------------------------
+        // Gyroscope reason
+        // ---------------------------------------------
+
+        if (!validGyroscope)
+        {
+          Serial.print("- Gyroscope movement too low (");
+          Serial.print(peakGyroscope, 2);
+          Serial.println(" < 50.0 deg/s)");
+        }
+
+        Serial.println();
+        Serial.println("Required:");
+
+        Serial.println("Duration >= 500 ms");
+        Serial.println("Peak Acceleration >= 4.0 m/s^2");
+        Serial.println("OR");
+        Serial.println("Peak Gyroscope >= 50 deg/s");
+
+        Serial.println();
+        Serial.println("Movement ignored.");
+        Serial.println("Ready for next stroke...");
+      }
+
+      // ===============================================
+      // RESET
+      // ===============================================
+
+      strokeActive = false;
+
+      peakAcceleration = 0.0;
+      peakGyroscope = 0.0;
+    }
+  }
+
+  // ===================================================
+  // SAMPLE RATE
+  // ===================================================
+
+  delay(20);
+}
