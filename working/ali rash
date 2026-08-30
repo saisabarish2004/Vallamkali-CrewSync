@@ -6,70 +6,31 @@ coach.py
 Vallamkali AI Sync Coach
 ============================================================
 
-Central ESP32 sends:
+CENTRAL -> PI
 
-    D|period,acc,angle|period,acc,angle
+D|period,acc,angle|period,acc,angle
 
 Example:
 
-    D|100,28,20|105,29,21
+D|100,28,20|105,30,22
 
 Meaning:
 
-    Rower 1:
-        period = 100 centiseconds
-        acc    = 28 / 10
-        angle  = 20 degrees
+Rower 1:
+    period = 100 centiseconds
+    acc    = 28
+    angle  = 20
 
-    Rower 2:
-        period = 105 centiseconds
-        acc    = 29 / 10
-        angle  = 21 degrees
+Rower 2:
+    period = 105 centiseconds
+    acc    = 30
+    angle  = 22
 
+PI -> CENTRAL
 
-Pi compares:
-
-    Rower 2 vs Rower 1
-
-Gemma decides whether the largest difference is significant.
-
-Pi sends back:
-
-    00
-        everybody OK
-
-    21
-        Rower 2
-        Timing fault
-
-    22
-        Rower 2
-        Angle fault
-
-    23
-        Rower 2
-        Power fault
-
-
-============================================================
-COMMANDS
-============================================================
-
-Test Gemma:
-
-    python3 coach.py --test
-
-Mock mode:
-
-    python3 coach.py --mock
-
-Real hardware:
-
-    python3 coach.py --port /dev/ttyAMA0 --model gemma3:1b
-
-Quiet:
-
-    python3 coach.py --port /dev/ttyAMA0 --quiet
+00 = all OK
+21 = rower 2 angle fault
+13 = rower 1 power fault
 
 ============================================================
 """
@@ -81,22 +42,14 @@ import time
 
 import requests
 
-
-# ============================================================
-# SERIAL
-# ============================================================
-
 try:
-
     import serial
-
 except ImportError:
-
     serial = None
 
 
 # ============================================================
-# OLLAMA
+# GEMMA
 # ============================================================
 
 URL = "http://127.0.0.1:11434/api/generate"
@@ -104,58 +57,41 @@ URL = "http://127.0.0.1:11434/api/generate"
 MODEL = "gemma3:1b"
 
 
-# ============================================================
-# GEMMA SYSTEM PROMPT
-# ============================================================
-
 SYSTEM = """
 You are a rowing synchronization judge.
 
 Two rowers should move together.
 
-The first rower is the reference leader.
-The second rower is the follower.
-
-You receive ONE numerical difference between them.
+Rower 1 is the leader.
+Rower 2 is the follower.
 
 Small differences are normal.
 
-Return Y only when the difference is large enough
-to indicate meaningful loss of synchronization.
+The supplied number is the absolute difference
+between the two rowers.
 
-Return N when the difference is normal.
+Rules:
 
-Use these limits:
-
-timing:
-    12 or less = N
-    above 12 = Y
-
-angle:
-    12 or less = N
-    above 12 = Y
-
-power:
-    12 or less = N
-    above 12 = Y
+number <= 12 = N
+number > 12  = Y
 
 Examples:
 
-timing 6 -> N
+timing 6  -> N
 timing 30 -> Y
 
-angle 5 -> N
-angle 20 -> Y
+angle 5   -> N
+angle 20  -> Y
 
-power 8 -> N
-power 25 -> Y
+power 8   -> N
+power 25  -> Y
 
-Answer ONLY Y or N.
+Return ONLY Y or N.
 """
 
 
 # ============================================================
-# MEASURES
+# MEASURE DEFINITIONS
 # ============================================================
 
 MEASURES = {
@@ -173,7 +109,7 @@ MEASURES = {
     "P": (
         "power",
         3
-    ),
+    )
 }
 
 
@@ -183,13 +119,18 @@ MEASURES = {
 
 QUIET = False
 
-MODEL = "gemma3:1b"
-
 pending = None
 
 confirmed = None
 
-sess = requests.Session()
+last_gemma_time = 0.0
+
+
+# ============================================================
+# HTTP SESSION
+# ============================================================
+
+session = requests.Session()
 
 
 # ============================================================
@@ -200,17 +141,18 @@ def say(*args):
 
     if not QUIET:
 
-        print(*args)
+        print(*args, flush=True)
 
 
 # ============================================================
-# GEMMA
+# ASK GEMMA
 # ============================================================
 
 def ask_gemma(question):
 
     """
-    Ask Gemma one yes/no question.
+    Ask Gemma whether the supplied difference
+    is large enough to trigger an alert.
 
     Returns:
 
@@ -233,22 +175,14 @@ def ask_gemma(question):
 
         "format": {
             "type": "string",
-            "enum": [
-                "Y",
-                "N"
-            ]
+            "enum": ["Y", "N"]
         },
 
         "options": {
-
             "temperature": 0,
-
             "top_k": 1,
-
             "num_predict": 3,
-
             "num_ctx": 256,
-
             "seed": 0
         }
     }
@@ -257,21 +191,21 @@ def ask_gemma(question):
 
     try:
 
-        response = sess.post(
+        response = session.post(
             URL,
             json=body,
-            timeout=10
+            timeout=30
         )
 
         response.raise_for_status()
 
         data = response.json()
 
-    except Exception as e:
+    except Exception as exc:
 
         say(
             "Gemma failed:",
-            e
+            exc
         )
 
         return None
@@ -281,61 +215,48 @@ def ask_gemma(question):
         ""
     )
 
-    answer = (
-        raw
-        .strip()
-        .strip('"')
-        .upper()
+    text = str(raw).strip().upper()
+
+    match = re.search(
+        r"\b([YN])\b",
+        text
     )
 
-    # Only accept a clean Y/N
-    if answer == "Y":
+    if match is None:
 
-        result = True
-
-    elif answer == "N":
-
-        result = False
-
-    else:
-
-        # Sometimes models return text like:
-        # "Y\n"
-        # or "The answer is Y"
+        # Sometimes models return just Y/N without word boundary issues
         match = re.search(
-            r"\b([YN])\b",
-            answer
+            r"[YN]",
+            text
         )
 
-        if not match:
+    if match is None:
 
-            say(
-                "Gemma returned invalid answer:",
-                repr(raw)
-            )
-
-            return None
-
-        result = (
-            match.group(1) == "Y"
+        say(
+            f"Gemma returned invalid response: {raw!r}"
         )
+
+        return None
+
+    answer = (
+        match.group(1) == "Y"
+    )
 
     elapsed = (
-        time.time() -
-        start
+        time.time() - start
     )
 
     say(
         f"Gemma: {raw!r} -> "
-        f"{'ALERT' if result else 'NO ALERT'} "
+        f"{'ALERT' if answer else 'NO ALERT'} "
         f"({elapsed:.2f}s)"
     )
 
-    return result
+    return answer
 
 
 # ============================================================
-# PARSE CENTRAL MESSAGE
+# PARSE CENTRAL DATA
 # ============================================================
 
 def parse_line(line):
@@ -352,7 +273,7 @@ def parse_line(line):
             2: {"T": ..., "P": ..., "A": ...}
         }
 
-    or None.
+    or None
     """
 
     line = line.strip()
@@ -382,15 +303,15 @@ def parse_line(line):
 
         try:
 
-            period_cs = float(
+            timing = float(
                 values[0]
             )
 
-            acc_x10 = float(
+            power = float(
                 values[1]
             )
 
-            angle_deg = float(
+            angle = float(
                 values[2]
             )
 
@@ -400,11 +321,11 @@ def parse_line(line):
 
         readings[rower_index] = {
 
-            "T": period_cs,
+            "T": timing,
 
-            "P": acc_x10,
+            "P": power,
 
-            "A": angle_deg
+            "A": angle
         }
 
     return readings
@@ -417,17 +338,23 @@ def parse_line(line):
 def worst(readings):
 
     """
-    Compare Rower 2 with Rower 1.
+    Rower 1 = leader
+    Rower 2 = follower
 
-    Returns:
+    Calculate:
 
-        (target_rower, measure, signed_difference)
+        follower - leader
 
-    Example:
+    for:
 
-        (2, "T", 25)
+        timing
+        power
+        angle
 
-    means Rower 2 is 25 units different in timing.
+    Return:
+
+        (rower, measure, difference)
+
     """
 
     if 1 not in readings:
@@ -442,17 +369,13 @@ def worst(readings):
 
     for key in MEASURES:
 
-        follower =
-            readings[2][key]
+        leader_value = readings[1][key]
 
-        leader =
-            readings[1][key]
+        follower_value = readings[2][key]
 
-        difference =
-            round(
-                follower -
-                leader
-            )
+        difference = round(
+            follower_value - leader_value
+        )
 
         if best is None:
 
@@ -482,17 +405,13 @@ def make_question(
     value
 ):
 
-    label =
-        MEASURES[key][0]
+    label = MEASURES[key][0]
 
-    return (
-        f"{label} "
-        f"{abs(value)}"
-    )
+    return f"{label} {abs(value)}"
 
 
 # ============================================================
-# CREATE CENTRAL COMMAND
+# CREATE PI -> CENTRAL PACKET
 # ============================================================
 
 def make_packet(
@@ -501,218 +420,137 @@ def make_packet(
     alert
 ):
 
-    """
-    Returns:
-
-        00
-        21
-        22
-        23
-    """
-
     if not alert:
 
         return "00"
 
-    fault =
-        MEASURES[key][1]
+    fault = MEASURES[key][1]
 
-    return (
-        f"{rower}"
-        f"{fault}"
-    )
+    return f"{rower}{fault}"
 
 
 # ============================================================
-# GEMMA TESTS
+# TEST DATA
 # ============================================================
 
 TESTS = [
 
-    (
-        ("T", 3),
-        False
-    ),
+    (("T", 3), False),
 
-    (
-        ("T", 60),
-        True
-    ),
+    (("T", 60), True),
 
-    (
-        ("A", 4),
-        False
-    ),
+    (("A", 4), False),
 
-    (
-        ("A", 25),
-        True
-    ),
+    (("A", 25), True),
 
-    (
-        ("P", 2),
-        False
-    ),
+    (("P", 2), False),
 
-    (
-        ("P", 30),
-        True
-    )
+    (("P", 30), True),
 ]
 
 
 # ============================================================
-# TEST GEMMA
+# GEMMA TEST
 # ============================================================
 
 def run_tests():
 
     print()
     print(
-        "========================================"
+        "===================================="
     )
 
     print(
-        "          GEMMA TEST"
+        "GEMMA TEST"
     )
 
     print(
-        "========================================"
+        "===================================="
     )
-
-    print()
-
-    print(
-        "Warming up Gemma..."
-    )
-
-    ask_gemma(
-        make_question(
-            "T",
-            3
-        )
-    )
-
-    print()
 
     passed = 0
 
     for (
-        key_value,
+        (key, value),
         expected
     ) in TESTS:
 
-        key, value = key_value
+        question = make_question(
+            key,
+            value
+        )
 
-        question =
-            make_question(
-                key,
-                value
-            )
-
+        print()
         print(
-            "Test:",
+            "QUESTION:",
             question
         )
 
-        result =
-            ask_gemma(
-                question
-            )
+        result = ask_gemma(
+            question
+        )
 
-        ok =
+        ok = (
             result == expected
+        )
 
         if ok:
 
             passed += 1
 
         print(
-            "  ",
-            "PASS" if ok else "FAIL",
-            "expected=",
-            "Y" if expected else "N"
+            "RESULT:",
+            "PASS" if ok else "FAIL"
         )
 
-        print()
+        print(
+            "EXPECTED:",
+            "ALERT" if expected else "NO ALERT"
+        )
 
+    print()
     print(
         f"{passed}/{len(TESTS)} tests passed"
     )
 
-    print()
-
 
 # ============================================================
-# MOCK DATA
+# FAKE DATA
 # ============================================================
 
 def fake_lines():
 
     """
-    Fake Rower 2 slowly drifting away.
+    Generate fake data.
+
+    Rower 1 remains stable.
+
+    Rower 2 slowly drifts.
     """
 
     import random
 
-    n = 0
+    counter = 0
 
     while True:
 
-        n += 1
+        counter += 1
 
-        drift =
-            min(
-                50,
-                5 * n
-            )
-
-        leader_period =
-            100 + random.randint(
-                -3,
-                3
-            )
-
-        leader_acc =
-            28 + random.randint(
-                -2,
-                2
-            )
-
-        leader_angle =
-            20 + random.randint(
-                -2,
-                2
-            )
-
-        follower_period =
-            100 + drift + random.randint(
-                -3,
-                3
-            )
-
-        follower_acc =
-            28 + random.randint(
-                -2,
-                2
-            )
-
-        follower_angle =
-            20 + random.randint(
-                -2,
-                2
-            )
+        drift = min(
+            50,
+            5 * counter
+        )
 
         line = (
 
             f"D|"
-            f"{leader_period},"
-            f"{leader_acc},"
-            f"{leader_angle}|"
-
-            f"{follower_period},"
-            f"{follower_acc},"
-            f"{follower_angle}"
+            f"{100 + random.randint(-3, 3)},"
+            f"{28 + random.randint(-2, 2)},"
+            f"{20 + random.randint(-2, 2)}"
+            f"|"
+            f"{100 + drift + random.randint(-3, 3)},"
+            f"{28 + random.randint(-2, 2)},"
+            f"{20 + random.randint(-2, 2)}"
         )
 
         yield line
@@ -733,29 +571,30 @@ def send_decision(
 
         return
 
+    message = (
+        packet + "\n"
+    ).encode(
+        "ascii"
+    )
+
     try:
 
         ser.write(
-            (
-                packet +
-                "\n"
-            ).encode(
-                "ascii"
-            )
+            message
         )
 
         ser.flush()
 
         say(
-            "TX -> Central:",
+            "TX CENTRAL:",
             packet
         )
 
-    except Exception as e:
+    except Exception as exc:
 
         say(
             "UART write failed:",
-            e
+            exc
         )
 
 
@@ -769,9 +608,9 @@ def main():
     global QUIET
     global pending
     global confirmed
+    global last_gemma_time
 
-    parser =
-        argparse.ArgumentParser()
+    parser = argparse.ArgumentParser()
 
     parser.add_argument(
         "--mock",
@@ -804,17 +643,14 @@ def main():
         default=115200
     )
 
-    args =
-        parser.parse_args()
+    args = parser.parse_args()
 
-    MODEL =
-        args.model
+    MODEL = args.model
 
-    QUIET =
-        args.quiet
+    QUIET = args.quiet
 
     # --------------------------------------------------------
-    # Gemma test
+    # TEST MODE
     # --------------------------------------------------------
 
     if args.test:
@@ -824,7 +660,7 @@ def main():
         return
 
     # --------------------------------------------------------
-    # Serial
+    # SERIAL
     # --------------------------------------------------------
 
     ser = None
@@ -840,132 +676,111 @@ def main():
 
         try:
 
-            ser =
-                serial.Serial(
-                    args.port,
-                    args.baud,
-                    timeout=1
-                )
+            ser = serial.Serial(
+                args.port,
+                args.baud,
+                timeout=1
+            )
 
-        except Exception as e:
+        except Exception as exc:
 
             sys.exit(
-                f"Could not open serial "
-                f"{args.port}: {e}"
+                f"Cannot open serial port "
+                f"{args.port}: {exc}"
             )
 
         say(
             f"Serial opened: "
-            f"{args.port} "
-            f"@ {args.baud}"
+            f"{args.port} @ {args.baud}"
         )
 
     # --------------------------------------------------------
-    # Warm Gemma
+    # GEMMA WARMUP
     # --------------------------------------------------------
 
     say(
         "Warming up Gemma..."
     )
 
-    warm =
-        ask_gemma(
-            make_question(
-                "T",
-                3
-            )
-        )
+    warmup = ask_gemma(
+        "timing 3"
+    )
 
-    if warm is None:
+    if warmup is None:
 
         say(
-            "WARNING: Gemma warm-up failed"
+            "WARNING: Gemma warmup failed."
         )
 
-    else:
-
-        say(
-            "Gemma ready"
-        )
+    say(
+        "Coach ready."
+    )
 
     print()
 
     # --------------------------------------------------------
-    # Source
+    # MOCK
     # --------------------------------------------------------
 
-    source = (
-        fake_lines()
-        if args.mock
-        else None
-    )
+    source = None
+
+    if args.mock:
+
+        source = fake_lines()
 
     # --------------------------------------------------------
-    # Decision timing
+    # DECISION TIMING
     # --------------------------------------------------------
 
-    last_analysis = 0
+    last_analysis = 0.0
 
     ANALYSIS_INTERVAL = 2.0
 
     # --------------------------------------------------------
-    # Main loop
+    # MAIN LOOP
     # --------------------------------------------------------
 
     while True:
 
-        # ----------------------------------------------------
-        # Get line
-        # ----------------------------------------------------
+        # ====================================================
+        # GET LINE
+        # ====================================================
 
         if args.mock:
 
-            line =
-                next(source)
+            line = next(source)
 
         else:
 
             try:
 
-                raw =
-                    ser.readline()
+                raw = ser.readline()
 
-                if not raw:
-
-                    continue
-
-                line =
-                    raw.decode(
-                        "ascii",
-                        "ignore"
-                    ).strip()
-
-            except Exception as e:
+            except Exception as exc:
 
                 say(
-                    "UART read failed:",
-                    e
+                    "Serial read error:",
+                    exc
                 )
 
                 time.sleep(1)
 
                 continue
 
-        # ----------------------------------------------------
-        # Parse
-        # ----------------------------------------------------
+            if not raw:
 
-        readings =
-            parse_line(
-                line
-            )
+                continue
 
-        if readings is None:
+            line = raw.decode(
+                "ascii",
+                "ignore"
+            ).strip()
 
-            say(
-                "Ignored:",
-                repr(line)
-            )
+        # ====================================================
+        # IGNORE EMPTY
+        # ====================================================
+
+        if not line:
 
             continue
 
@@ -974,29 +789,42 @@ def main():
             line
         )
 
-        # ----------------------------------------------------
-        # Don't ask Gemma too frequently
-        # ----------------------------------------------------
+        # ====================================================
+        # PARSE
+        # ====================================================
 
-        now =
-            time.time()
+        readings = parse_line(
+            line
+        )
+
+        if readings is None:
+
+            say(
+                "Invalid packet - ignored"
+            )
+
+            continue
+
+        # ====================================================
+        # WAIT BETWEEN GEMMA REQUESTS
+        # ====================================================
+
+        now = time.time()
 
         if (
-            now -
-            last_analysis <
-            ANALYSIS_INTERVAL
+            now - last_analysis
+            < ANALYSIS_INTERVAL
         ):
 
             continue
 
-        # ----------------------------------------------------
-        # Find worst difference
-        # ----------------------------------------------------
+        # ====================================================
+        # FIND WORST
+        # ====================================================
 
-        result =
-            worst(
-                readings
-            )
+        result = worst(
+            readings
+        )
 
         if result is None:
 
@@ -1006,121 +834,92 @@ def main():
 
             continue
 
-        rower, key, difference =
-            result
+        rower, key, difference = result
 
-        label =
-            MEASURES[key][0]
+        # ====================================================
+        # QUESTION
+        # ====================================================
 
-        say(
-            f"Difference: "
-            f"R{rower} "
-            f"{label} "
-            f"{difference}"
+        question = make_question(
+            key,
+            difference
         )
 
-        # ----------------------------------------------------
-        # IMPORTANT:
-        #
-        # If either rower has zero period because we don't
-        # yet have a complete stroke, don't ask Gemma.
-        # ----------------------------------------------------
-
-        if (
-            key == "T" and
-            abs(difference) == 0
-        ):
-
-            say(
-                "Timing difference is zero"
-            )
-
-        # ----------------------------------------------------
-        # Ask Gemma
-        # ----------------------------------------------------
-
-        question =
-            make_question(
-                key,
-                difference
-            )
-
         say(
-            "Gemma question:",
+            "Analysis:",
             question
         )
 
-        alert =
-            ask_gemma(
-                question
-            )
+        # ====================================================
+        # GEMMA
+        # ====================================================
+
+        alert = ask_gemma(
+            question
+        )
 
         if alert is None:
 
-            continue
-
-        # ----------------------------------------------------
-        # Make packet
-        # ----------------------------------------------------
-
-        packet =
-            make_packet(
-                rower,
-                key,
-                alert
+            say(
+                "No decision because Gemma failed."
             )
 
-        # ----------------------------------------------------
-        # Confirmation filter
-        #
-        # One abnormal reading must not immediately trigger
-        # the wearable.
-        #
-        # Same decision must occur twice.
-        # ----------------------------------------------------
+            last_analysis = now
 
-        if packet == pending:
+            continue
 
-            # Same decision repeated
-            if packet != confirmed:
+        # ====================================================
+        # CREATE PACKET
+        # ====================================================
 
-                confirmed =
-                    packet
+        output = make_packet(
+            rower,
+            key,
+            alert
+        )
+
+        # ====================================================
+        # REQUIRE SAME VERDICT TWICE
+        # ====================================================
+
+        if output == pending:
+
+            if output != confirmed:
+
+                confirmed = output
 
                 say(
                     "CONFIRMED:",
-                    packet
+                    output
                 )
 
                 send_decision(
                     ser,
-                    packet
+                    output
                 )
 
             else:
 
                 say(
                     "Decision unchanged:",
-                    packet
+                    output
                 )
 
         else:
 
-            pending =
-                packet
+            pending = output
 
             say(
-                "Waiting for same decision "
-                "to repeat:",
-                packet
+                "Pending:",
+                output,
+                "(waiting for repeat)"
             )
 
-        last_analysis =
-            now
+        last_analysis = now
 
 
 # ============================================================
-# PROGRAM START
+# PROGRAM ENTRY
 # ============================================================
 
 if __name__ == "__main__":
